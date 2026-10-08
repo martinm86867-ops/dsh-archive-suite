@@ -1,0 +1,3 @@
+- insert:
+    - id: archive-suite-tools
+      name: '@martinm86867-ops/dsh-archive-suite'

@@ -1,0 +1,26 @@
+{
+  "name": "@martinm86867-ops/dsh-archive-suite",
+  "version": "1.6.0",
+  "description": "Archive.org & Wayback Machine power suite for DeepSeek Harness: full-text search over document content, page-anchored passage retrieval, provenance and variant reconciliation over a local columnar corpus, IAS3 storage, SPN2 preservation, CDX queries, and pipeline orchestration.",
+  "type": "module",
+  "main": "index.js",
+  "exports": {
+    ".": "./index.js",
+    "./package.json": "./package.json",
+    "./cordis.patch.yml": "./cordis.patch.yml"
+  },
+  "files": [
+    "index.js",
+    "bridge.py",
+    "cordis.patch.yml",
+    "package.json",
+    "README.md",
+    "index.mjs"
+  ],
+  "dsh": {
+    "bundle": {
+      "patch": "./cordis.patch.yml"
+    }
+  },
+  "license": "MIT"
+}
