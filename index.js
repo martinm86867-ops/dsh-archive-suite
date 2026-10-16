@@ -21,6 +21,12 @@ import { resolve, dirname, delimiter, join } from 'node:path'
 import { fileURLToPath } from 'node:url'
 import { existsSync, accessSync, constants, readFileSync } from 'node:fs'
 import { evaluateGroundedResults } from './eval-grounded.js'
+import {
+  recordTelemetryRun,
+  renderObservatoryHtml,
+  buildTelemetryPayload,
+  executeObservatoryRun,
+} from './observatory.js'
 
 const __dirname = dirname(fileURLToPath(import.meta.url))
 
@@ -93,8 +99,9 @@ export function archiveAvailable() {
   return isExecutable(PYTHON_PATH)
 }
 
-/** Run Python bridge command with JSON stdin/stdout. */
-export function runBridge(command, args = {}, timeoutMs = BRIDGE_TIMEOUT_MS) {
+/** Run Python bridge command with JSON stdin/stdout and automatic telemetry recording. */
+export function runBridge(command, args = {}, timeoutMs = BRIDGE_TIMEOUT_MS, opts = {}) {
+  const startedAt = Date.now()
   return new Promise((resolvePromise, rejectPromise) => {
     const py = resolvePython()
     let child
@@ -115,6 +122,15 @@ export function runBridge(command, args = {}, timeoutMs = BRIDGE_TIMEOUT_MS) {
       if (settled) return
       settled = true
       clearTimeout(timer)
+      if (!opts.skipTelemetry && command !== 'keys_status' && command !== 'corpus_stats' && command !== 'corpus_sql') {
+        recordTelemetryRun({
+          command,
+          args,
+          res: value,
+          error: err,
+          durationMs: Date.now() - startedAt,
+        })
+      }
       if (err) rejectPromise(err)
       else resolvePromise(value)
     }
@@ -1617,6 +1633,51 @@ ${wins || '  (no high-density conceptual alignments found)'}
         }
         sctx.skills.registerProvider(() => provider)
       } catch { /* skill already registered or optional */ }
+    })
+
+    // Register local Web Observatory endpoints on the DSH Web Server (http://127.0.0.1:3080/api/dsh-archive/observatory)
+    ctx.inject(['webServer'], (wctx) => {
+      try {
+        wctx.webServer.register({
+          kind: 'exact',
+          path: '/api/dsh-archive/observatory',
+          handler: async (req, res) => {
+            if (req.method !== 'GET') { res.writeHead(405); res.end(); return }
+            res.writeHead(200, { 'Content-Type': 'text/html; charset=utf-8', 'Cache-Control': 'no-store' })
+            res.end(renderObservatoryHtml())
+          },
+        })
+        wctx.webServer.register({
+          kind: 'exact',
+          path: '/api/dsh-archive/telemetry',
+          handler: async (req, res) => {
+            if (req.method !== 'GET') { res.writeHead(405); res.end(); return }
+            const payload = await buildTelemetryPayload(runBridge)
+            res.writeHead(200, { 'Content-Type': 'application/json', 'Cache-Control': 'no-store' })
+            res.end(JSON.stringify(payload))
+          },
+        })
+        wctx.webServer.register({
+          kind: 'exact',
+          path: '/api/dsh-archive/run',
+          handler: async (req, res) => {
+            if (req.method !== 'POST') { res.writeHead(405); res.end(); return }
+            let raw = ''
+            req.on('data', (c) => { raw += c.toString('utf8') })
+            req.on('end', async () => {
+              try {
+                const body = JSON.parse(raw || '{}')
+                const out = await executeObservatoryRun(runBridge, body)
+                res.writeHead(200, { 'Content-Type': 'application/json' })
+                res.end(JSON.stringify({ ok: true, result: out }))
+              } catch (err) {
+                res.writeHead(500, { 'Content-Type': 'application/json' })
+                res.end(JSON.stringify({ ok: false, error: String((err && err.message) || err) }))
+              }
+            })
+          },
+        })
+      } catch { /* routes already registered or webServer unavailable */ }
     })
   }
 }

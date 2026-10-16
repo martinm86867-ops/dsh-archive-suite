@@ -251,3 +251,73 @@ test('archivist-research-agent skill is packaged with valid frontmatter and regi
   const loaded = await registeredProvider.get(list[0])
   assert.match(loaded.content, /archive_epistemic_dossier/)
 })
+
+test('observatory telemetry records tool runs, extracts sources, and mounts webServer routes', async () => {
+  const { recordTelemetryRun, readTelemetryRuns, renderObservatoryHtml } = await import('../observatory.js')
+  const recorded = recordTelemetryRun({
+    command: 'epistemic_dossier',
+    args: { statement: 'Does "Report from Iron Mountain" hold any merit?' },
+    durationMs: 1420,
+    res: {
+      trace: {
+        recorded: { documents: 2116 },
+        primary_record: { documents: 42, examples: [{ identifier: 'cia-rdp88-01350r000200370012-1', title: 'CIA Iron Mountain File', tier: 'T1', url: 'https://archive.org/details/cia-rdp88' }] },
+        triangulation: {
+          subject_core: '"Report from Iron Mountain"',
+          caller_framing_stripped: true,
+          corroboration_axis: { documents: 1170 },
+          critique_axis: { documents: 465 },
+          substance_axis: { documents: 1819 },
+        },
+        evidence: [
+          {
+            identifier: 'peacewarindustry0000unse_r1z0',
+            title: 'Peace and the War Industry',
+            page: 184,
+            page_scope: 'item_aggregate',
+            provenance: { tier: 'T2' },
+            stance: 'states',
+            url: 'https://archive.org/details/peacewarindustry0000unse_r1z0',
+            quote: 'Report from Iron Mountain remains a model of policy analysis.',
+          },
+        ],
+      },
+      forensic_report: {
+        identifier_a: 'pdfy-A5uQx1ByqfwWuHma',
+        identifier_b: 'lewin-l.-c.-report-from-iron-mountain-and-nyt-article-1967',
+        exact_8gram_shingles: { observed: 13858, shuffled_null: 0, excess_over_null: 13858 },
+        conceptual_window_alignments: [{ shared_distinctive_terms: 207, jaccard: 0.4652, terms: ['polemology', 'bouthoul', 'disarmament'] }],
+      },
+    },
+  })
+
+  assert.ok(recorded && recorded.id, 'Telemetry run must return a record id')
+  assert.equal(recorded.triangulation.total_circulation, 2116)
+  assert.equal(recorded.forensics.excess_8grams, 13858)
+  assert.ok(recorded.sources.length >= 2)
+
+  const recent = readTelemetryRuns(5)
+  assert.ok(recent.some((r) => r.id === recorded.id))
+
+  const html = renderObservatoryHtml()
+  assert.match(html, /Archivist Epistemic & Forensic Observatory/)
+
+  const routes = []
+  apply({
+    tools: { register() {} },
+    inject(deps, fn) {
+      if (deps.includes('webServer')) {
+        fn({
+          webServer: {
+            register(route) { routes.push(route.path) },
+          },
+        })
+      }
+    },
+  })
+  assert.deepEqual(routes, [
+    '/api/dsh-archive/observatory',
+    '/api/dsh-archive/telemetry',
+    '/api/dsh-archive/run',
+  ])
+})

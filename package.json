@@ -7,15 +7,18 @@
   "scripts": {
     "test": "node --test test/*.test.js && ./.venv/bin/python -m pytest tests -o cache_dir=/tmp/pytest_cache",
     "test:js": "node --test test/*.test.js",
-    "test:py": "./.venv/bin/python -m pytest tests -o cache_dir=/tmp/pytest_cache"
+    "test:py": "./.venv/bin/python -m pytest tests -o cache_dir=/tmp/pytest_cache",
+    "observatory": "node observatory.js"
   },
   "exports": {
     ".": "./index.js",
+    "./observatory": "./observatory.js",
     "./package.json": "./package.json",
     "./cordis.patch.yml": "./cordis.patch.yml"
   },
   "files": [
     "index.js",
+    "observatory.js",
     "eval-grounded.js",
     "bridge.py",
     "archivist",
