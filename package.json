@@ -1,9 +1,14 @@
 {
   "name": "@martinm86867-ops/dsh-archive-suite",
-  "version": "1.6.0",
-  "description": "Archive.org & Wayback Machine power suite for DeepSeek Harness: full-text search over document content, page-anchored passage retrieval, provenance and variant reconciliation over a local columnar corpus, IAS3 storage, SPN2 preservation, CDX queries, and pipeline orchestration.",
+  "version": "1.9.0",
+  "description": "Archive.org, Wayback Machine & Epistemic Fact-Checking power suite for DeepSeek Harness (43 native tools + bundled archivist-research-agent skill): works standalone or hybrid with Jina, featuring one-call epistemic & forensic dossiers (95% token reduction), primary-text shingle/window comparison, full-text OCR search, T1 primary-record claim tracing, lending-restricted FTS passage extraction, Wayback snapshot reader, IIIF image/crop extraction, DuckDB analytical corpus & warehouse, IAS3 storage, SPN2 preservation, and pipeline orchestration.",
   "type": "module",
   "main": "index.js",
+  "scripts": {
+    "test": "node --test test/*.test.js && ./.venv/bin/python -m pytest tests -o cache_dir=/tmp/pytest_cache",
+    "test:js": "node --test test/*.test.js",
+    "test:py": "./.venv/bin/python -m pytest tests -o cache_dir=/tmp/pytest_cache"
+  },
   "exports": {
     ".": "./index.js",
     "./package.json": "./package.json",
@@ -11,10 +16,15 @@
   },
   "files": [
     "index.js",
+    "eval-grounded.js",
     "bridge.py",
+    "archivist",
+    "pipelines",
+    "skills",
     "cordis.patch.yml",
     "package.json",
     "README.md",
+    "CHANGELOG.md",
     "index.mjs"
   ],
   "dsh": {

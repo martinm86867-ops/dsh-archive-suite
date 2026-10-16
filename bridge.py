@@ -6,8 +6,11 @@ import json
 import asyncio
 from pathlib import Path
 
-# Ensure archivist is in python path
-WORKSPACE_ARCHIVE = Path(os.environ.get("DSH_ARCHIVE_HOME", "/home/martin/archive"))
+# Ensure archivist is in python path (prefer local vendored checkout, overridable via DSH_ARCHIVE_HOME)
+_DEFAULT_HOME = Path(__file__).resolve().parent
+WORKSPACE_ARCHIVE = Path(os.environ.get("DSH_ARCHIVE_HOME") or (
+    _DEFAULT_HOME if (_DEFAULT_HOME / "archivist").is_dir() else Path("/home/martin/archive")
+))
 if str(WORKSPACE_ARCHIVE) not in sys.path:
     sys.path.insert(0, str(WORKSPACE_ARCHIVE))
 
@@ -30,36 +33,62 @@ async def handle_search(args: dict) -> dict:
         qb.mediatype(args["mediatype"])
     if args.get("collection"):
         qb.collection(args["collection"])
+    if args.get("creator"):
+        qb.creator(args["creator"])
+    if args.get("title"):
+        qb.title(args["title"])
+    if args.get("subject"):
+        qb.subject(args["subject"])
+    if args.get("year"):
+        qb.year(args["year"])
+    if args.get("date_from") and args.get("date_to"):
+        qb.date_range(args["date_from"], args["date_to"])
+    if args.get("format"):
+        qb.format(args["format"])
 
     query = qb.build()
+    sorts = None
+    if args.get("sort"):
+        sorts = [args["sort"]] if isinstance(args["sort"], str) else list(args["sort"])
+
     cfg = ArchivistConfig.load(search_dir=WORKSPACE_ARCHIVE)
     async with ArchiveClient(cfg) as client:
         res = await client.search(
             query=query,
             rows=int(args.get("rows", 10)),
             page=int(args.get("page", 1)),
-            fields=["identifier", "title", "mediatype", "downloads", "date", "publicdate"]
+            fields=args.get("fields") or ["identifier", "title", "mediatype", "collection", "creator", "downloads", "date", "publicdate"],
+            sorts=sorts,
         )
         return {"query": query, "num_found": res.get("numFound", 0), "docs": res.get("docs", [])}
 
 
 async def handle_item_info(args: dict) -> dict:
     ident = args["identifier"]
+    max_files = int(args.get("max_files", 25))
+    format_filter = (args.get("format_filter") or "").lower().strip()
     cfg = ArchivistConfig.load(search_dir=WORKSPACE_ARCHIVE)
     async with ArchiveClient(cfg) as client:
         meta = await client.get_metadata(ident)
         files = meta.get("files", [])
+        if format_filter:
+            files = [f for f in files if format_filter in str(f.get("format", "")).lower() or format_filter in str(f.get("name", "")).lower()]
         m = meta.get("metadata", {})
         return {
             "identifier": ident,
             "title": m.get("title"),
             "mediatype": m.get("mediatype"),
             "collection": m.get("collection"),
+            "creator": m.get("creator"),
+            "date": m.get("date"),
+            "description": str(m.get("description") or "")[:600],
             "server": meta.get("server"),
+            "dir": meta.get("dir"),
             "item_size": meta.get("item_size", 0),
-            "files_count": len(files),
+            "files_count": len(meta.get("files", [])),
+            "filtered_files_count": len(files),
             "url": f"https://archive.org/details/{ident}",
-            "sample_files": files[:10]
+            "sample_files": files[:max_files]
         }
 
 
@@ -78,8 +107,8 @@ async def handle_item_upload(args: dict) -> dict:
 
 async def handle_wayback_cdx(args: dict) -> dict:
     url = args["url"]
-    limit = int(args.get("limit", 20))
-    match_type = args.get("match_type", "prefix")
+    limit = int(args.get("limit", 15))
+    match_type = args.get("match_type", "exact")
     cfg = ArchivistConfig.load(search_dir=WORKSPACE_ARCHIVE)
     async with ArchiveClient(cfg) as client:
         snapshots = await client.cdx_search(
@@ -138,10 +167,9 @@ async def handle_research_search(args: dict) -> dict:
     query = args["query"]
     limit = int(args.get("limit", 5))
     wh_path = Path(args.get("warehouse") or (WORKSPACE_ARCHIVE / "data" / "research_warehouse.duckdb"))
-    wh = DuckDBWarehouse(wh_path)
-    results = wh.search_bm25(query, limit=limit)
-    stats = wh.get_stats()
-    wh.close()
+    with DuckDBWarehouse(wh_path) as wh:
+        results = wh.search_bm25(query, limit=limit)
+        stats = wh.get_stats()
     return {"query": query, "count": len(results), "warehouse_stats": stats, "results": results}
 
 
@@ -149,9 +177,8 @@ async def handle_research_prompt(args: dict) -> dict:
     query = args["query"]
     limit = int(args.get("limit", 3))
     wh_path = Path(args.get("warehouse") or (WORKSPACE_ARCHIVE / "data" / "research_warehouse.duckdb"))
-    wh = DuckDBWarehouse(wh_path)
-    results = wh.search_bm25(query, limit=limit)
-    wh.close()
+    with DuckDBWarehouse(wh_path) as wh:
+        results = wh.search_bm25(query, limit=limit)
     prompt = LLMContextFormatter.build_research_prompt(query, results)
     return {"query": query, "evidence_cards_count": len(results), "prompt": prompt}
 
@@ -166,13 +193,80 @@ async def handle_media_manifest(args: dict) -> dict:
 
 
 async def handle_media_read_text(args: dict) -> dict:
+    """Read text slice from an item, with local cache, offset pagination, and regex grep."""
+    import re
+    from archivist.fulltext import FullTextEngine
     from archivist.media import MediaAccessEngine
     ident = args["identifier"]
-    max_chars = int(args.get("max_chars", 5000))
+    offset = int(args.get("offset", 0))
+    max_chars = int(args.get("max_chars", 6000))
+    pattern = args.get("grep") or args.get("pattern")
+    context_chars = int(args.get("context_chars", 240))
+
     cfg = ArchivistConfig.load(search_dir=WORKSPACE_ARCHIVE)
     async with ArchiveClient(cfg) as client:
-        engine = MediaAccessEngine(client)
-        return await engine.read_full_text(ident, max_chars=max_chars)
+        ft = FullTextEngine(client)
+        try:
+            fetched = await ft.fetch_text(ident, max_chars=max(offset + max_chars, 500_000) if pattern else (offset + max_chars))
+        except ArchiveError:
+            fetched = {"found": False}
+
+        if fetched.get("found") and fetched.get("text"):
+            full_text = fetched["text"]
+            total_chars = fetched.get("chars", len(full_text))
+            filename = fetched.get("file", f"{ident}_djvu.txt")
+            file_url = fetched.get("source_url", f"https://archive.org/download/{ident}/{filename}")
+        else:
+            engine = MediaAccessEngine(client)
+            res = await engine.read_full_text(ident, max_chars=offset + max_chars)
+            if not res.get("found"):
+                return res
+            full_text = res["text"]
+            total_chars = len(full_text)
+            filename = res["filename"]
+            file_url = res["full_file_url"]
+
+        if pattern:
+            matches = []
+            try:
+                rx = re.compile(pattern, re.IGNORECASE)
+            except re.error:
+                rx = re.compile(re.escape(pattern), re.IGNORECASE)
+            for m in rx.finditer(full_text):
+                s = max(0, m.start() - context_chars)
+                e = min(len(full_text), m.end() + context_chars)
+                matches.append({
+                    "offset": m.start(),
+                    "match": m.group(0),
+                    "excerpt": full_text[s:e].replace("\n", " ").strip(),
+                })
+                if len(matches) >= int(args.get("max_matches", 15)):
+                    break
+            return {
+                "identifier": ident,
+                "filename": filename,
+                "found": True,
+                "mode": "grep",
+                "pattern": pattern,
+                "total_chars": total_chars,
+                "match_count": len(matches),
+                "matches": matches,
+                "full_file_url": file_url,
+            }
+
+        sliced = full_text[offset:offset + max_chars]
+        return {
+            "identifier": ident,
+            "filename": filename,
+            "found": True,
+            "mode": "slice",
+            "offset": offset,
+            "next_offset": (offset + len(sliced)) if (offset + len(sliced)) < total_chars else None,
+            "total_chars": total_chars,
+            "length_read": len(sliced),
+            "text": sliced,
+            "full_file_url": file_url,
+        }
 
 
 async def handle_media_book_search(args: dict) -> dict:
@@ -230,6 +324,12 @@ async def handle_views(args: dict) -> dict:
 async def handle_keys_status(args: dict) -> dict:
     cfg = ArchivistConfig.load(search_dir=WORKSPACE_ARCHIVE)
     async with ArchiveClient(cfg) as client:
+        creds = client.rotation_manager.current_credentials
+        if creds:
+            try:
+                await client.get_user_spn_quota()
+            except Exception:
+                pass
         statuses = client.rotation_manager.get_pool_status()
         return {"total_keys": len(statuses), "keys": statuses}
 
@@ -384,14 +484,21 @@ async def handle_text_availability(args: dict) -> dict:
 
 
 async def handle_text_harvest(args: dict) -> dict:
-    """Download text into the local store, once, politely."""
+    """Download text into the local store, and auto-build the DuckDB corpus by default."""
     from archivist.fulltext import FullTextEngine
+    from archivist.textstore import TextStore
     cfg = ArchivistConfig.load(search_dir=WORKSPACE_ARCHIVE)
     async with ArchiveClient(cfg) as client:
-        return await FullTextEngine(client).harvest_text(
+        report = await FullTextEngine(client).harvest_text(
             args["identifiers"], pause=float(args.get("pause", 1.0)),
             max_docs=args.get("max_docs"),
         )
+        if args.get("auto_build", True):
+            store = TextStore(Path(args.get("store") or (WORKSPACE_ARCHIVE / "data" / "text_cache")))
+            corpus_res = _corpus_db(args).build_from_store(store, replace=False)
+            report["corpus_built"] = corpus_res.get("documents", 0)
+            report["corpus_stats"] = corpus_res.get("stats", {})
+        return report
 
 
 async def handle_text_store(args: dict) -> dict:
@@ -535,14 +642,208 @@ async def handle_agent_query(args: dict) -> dict:
     query = args["query"]
     limit = int(args.get("limit", 5))
     tier = args.get("tier")
-    bridge = AgentArchiveBridge()
+    cfg = ArchivistConfig.load(search_dir=WORKSPACE_ARCHIVE)
+    wh_path = Path(args.get("warehouse") or (cfg.data_dir / "research_warehouse.duckdb"))
+    bridge = AgentArchiveBridge(warehouse_path=wh_path)
     cards = bridge.query_agent_cards(query, limit=limit, require_tier=tier)
+    bridge.warehouse.close()
     return {
         "query": query,
         "card_count": len(cards),
         "cards": cards,
         "formatted_prompt": bridge.format_agent_prompt(query, cards)
     }
+
+
+async def handle_wayback_read(args: dict) -> dict:
+    """Fetch a historical Wayback Machine snapshot and extract clean readable text (or raw HTML)."""
+    from bs4 import BeautifulSoup
+    url = args["url"]
+    timestamp = args.get("timestamp")
+    max_chars = int(args.get("max_chars", 8000))
+    offset = int(args.get("offset", 0))
+    raw_html = bool(args.get("raw_html", False))
+
+    cfg = ArchivistConfig.load(search_dir=WORKSPACE_ARCHIVE)
+    async with ArchiveClient(cfg) as client:
+        if not timestamp:
+            rows = await client.cdx_search(
+                url=url, match_type="exact", limit=-1, status_codes=[200], fl=["timestamp", "original", "statuscode"]
+            )
+            if not rows:
+                return {"url": url, "found": False, "error": f"No archived snapshot found on Wayback Machine for {url}"}
+            timestamp = rows[-1].get("timestamp")
+
+        raw_bytes = await client.get_wayback_snapshot(url, str(timestamp), raw=True)
+        html_str = raw_bytes.decode("utf-8", errors="ignore")
+        playback_url = f"https://web.archive.org/web/{timestamp}/{url}"
+
+        if raw_html:
+            sliced = html_str[offset:offset + max_chars]
+            return {
+                "url": url,
+                "timestamp": str(timestamp),
+                "playback_url": playback_url,
+                "found": True,
+                "mode": "raw_html",
+                "total_chars": len(html_str),
+                "offset": offset,
+                "text": sliced,
+            }
+
+        soup = BeautifulSoup(html_str, "html.parser")
+        title = soup.title.string.strip() if (soup.title and soup.title.string) else url
+        for tag in soup(["script", "style", "noscript", "svg"]):
+            tag.decompose()
+        clean_text = soup.get_text(separator="\n", strip=True)
+        sliced = clean_text[offset:offset + max_chars]
+        return {
+            "url": url,
+            "title": title,
+            "timestamp": str(timestamp),
+            "playback_url": playback_url,
+            "found": True,
+            "mode": "clean_text",
+            "total_chars": len(clean_text),
+            "offset": offset,
+            "next_offset": (offset + len(sliced)) if (offset + len(sliced)) < len(clean_text) else None,
+            "text": sliced,
+        }
+
+
+async def handle_iiif_image(args: dict) -> dict:
+    """Extract canonical IIIF Image API 3.0 URLs and optional cropped figure downloads for digitized book pages."""
+    from archivist.iiif import IIIFEngine
+    ident = args["identifier"]
+    page_number = int(args.get("page_number", 1))
+    region = args.get("region", "full")
+    size = args.get("size", "max")
+    rotation = int(args.get("rotation", 0))
+    fmt = args.get("format", "jpg")
+    download_path = args.get("download_path")
+
+    cfg = ArchivistConfig.load(search_dir=WORKSPACE_ARCHIVE)
+    async with ArchiveClient(cfg) as client:
+        iiif = IIIFEngine(client)
+        info = await iiif.get_page_image_url(
+            identifier=ident, page_number=page_number, region=region, size=size, rotation=rotation, fmt=fmt
+        )
+        if download_path:
+            dest = Path(download_path)
+            dest.parent.mkdir(parents=True, exist_ok=True)
+            session = await client.get_session()
+            r = await session.get(info["iiif_url"])
+            if r.status_code != 200:
+                return {**info, "downloaded": False, "error": f"IIIF download failed (HTTP {r.status_code})"}
+            dest.write_bytes(r.content)
+            info["downloaded"] = True
+            info["saved_path"] = str(dest.resolve())
+            info["bytes"] = len(r.content)
+        return info
+
+
+async def handle_lending_borrow(args: dict) -> dict:
+    """Borrow, browse (1-hour loan), or return a lending-restricted item when a PatronSession cookie is configured."""
+    from archivist.fulltext import FullTextEngine
+    ident = args["identifier"]
+    action = args.get("action", "browse_book")
+    cfg = ArchivistConfig.load(search_dir=WORKSPACE_ARCHIVE)
+    cookie = args.get("patron_cookie") or os.environ.get("IA_PATRON_COOKIE")
+    if cookie:
+        from archivist.config import PatronSession
+        cfg.patron_session = PatronSession(cookie=cookie)
+    async with ArchiveClient(cfg) as client:
+        engine = FullTextEngine(client)
+        if action == "return_loan":
+            return await engine.return_item(ident)
+        return await engine.borrow_item(ident, action=action)
+
+
+async def handle_item_manage(args: dict) -> dict:
+    """Create items, patch metadata, delete files, or inspect background derivation tasks."""
+    op = args["operation"]
+    ident = args["identifier"]
+    cfg = ArchivistConfig.load(search_dir=WORKSPACE_ARCHIVE)
+    async with ArchiveClient(cfg) as client:
+        if op == "tasks":
+            return await client.get_tasks(ident)
+        if op == "create":
+            return await client.create_item(
+                identifier=ident,
+                title=args.get("title", ident),
+                mediatype=args.get("mediatype"),
+                collection=args.get("collection"),
+                description=args.get("description"),
+                creator=args.get("creator"),
+                date=args.get("date"),
+                subject=args.get("subject"),
+                extra_metadata=args.get("extra_metadata"),
+            )
+        if op == "patch_metadata":
+            patches = args.get("patches") or []
+            return await client.modify_metadata(ident, patches)
+        if op == "delete_file":
+            filename = args["filename"]
+            ok = await client.delete_file(ident, filename)
+            return {"identifier": ident, "filename": filename, "deleted": ok}
+        if op == "server_nodes":
+            srv = await client.get_item_subpath(ident, "server")
+            workable = await client.get_item_subpath(ident, "workable_servers")
+            return {"identifier": ident, "server": srv, "workable_servers": workable}
+        return {"error": f"Unknown item_manage operation: {op}"}
+
+
+async def handle_research_timeline(args: dict) -> dict:
+    """Retrieve temporal timeline of captures for a URL or entity in the local DuckDB warehouse."""
+    source_key = args["source_key"]
+    cfg = ArchivistConfig.load(search_dir=WORKSPACE_ARCHIVE)
+    wh_path = Path(args.get("warehouse") or (cfg.data_dir / "research_warehouse.duckdb"))
+    with DuckDBWarehouse(wh_path) as wh:
+        timeline = wh.get_timeline(source_key)
+    return {"source_key": source_key, "count": len(timeline), "timeline": timeline}
+
+
+
+async def handle_forensic_compare(args: dict) -> dict:
+    """Direct primary-text forensic comparison between two documents (auto-harvesting if needed)."""
+    from archivist.analysis import CorpusAnalysis
+    from archivist.fulltext import FullTextEngine
+    ident_a = args["identifier_a"]
+    ident_b = args["identifier_b"]
+    cfg = ArchivistConfig.load(search_dir=WORKSPACE_ARCHIVE)
+    async with ArchiveClient(cfg) as client:
+        ft = FullTextEngine(client)
+        db = _corpus_db(args)
+        analysis = CorpusAnalysis(db, ft)
+        await analysis.ensure_local([ident_a, ident_b], pause=0.2)
+        return analysis.forensic_compare(
+            ident_a,
+            ident_b,
+            window_tokens=int(args.get("window_tokens", 250)),
+            step_tokens=int(args.get("step_tokens", 125)),
+            top_passages=int(args.get("top_passages", 8)),
+        )
+
+
+async def handle_epistemic_dossier(args: dict) -> dict:
+    """One-shot autonomous 5-stage epistemic & primary-text forensic dossier."""
+    from archivist.analysis import CorpusAnalysis
+    from archivist.fulltext import FullTextEngine
+    statement = args["statement"]
+    compare_with = args.get("compare_with")
+    focus_terms = args.get("focus_terms")
+    max_harvest = int(args.get("max_harvest", 2))
+    cfg = ArchivistConfig.load(search_dir=WORKSPACE_ARCHIVE)
+    async with ArchiveClient(cfg) as client:
+        ft = FullTextEngine(client)
+        db = _corpus_db(args)
+        analysis = CorpusAnalysis(db, ft)
+        return await analysis.epistemic_dossier(
+            statement=statement,
+            compare_with=compare_with,
+            focus_terms=focus_terms,
+            max_harvest=max_harvest,
+        )
 
 
 COMMANDS = {
@@ -591,6 +892,14 @@ COMMANDS = {
     "corpus_diff": handle_corpus_diff,
     "corpus_phrase": handle_corpus_phrase,
     "corpus_sql": handle_corpus_sql,
+    # zero-code agent extensions
+    "wayback_read": handle_wayback_read,
+    "iiif_image": handle_iiif_image,
+    "lending_borrow": handle_lending_borrow,
+    "item_manage": handle_item_manage,
+    "research_timeline": handle_research_timeline,
+    "forensic_compare": handle_forensic_compare,
+    "epistemic_dossier": handle_epistemic_dossier,
 }
 
 

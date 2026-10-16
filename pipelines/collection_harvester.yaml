@@ -1,0 +1,35 @@
+name: "collection-harvester-pipeline"
+description: "Search Archive.org collection, filter items, and index metadata to SQLite"
+concurrency: 3
+batch_size: 10
+max_items: 15
+resume: true
+state_db: "./data/pipeline_state.db"
+
+source:
+  type: "search"
+  name: "nasa_imagery_search"
+  params:
+    query: "collection:(nasa) AND mediatype:(image)"
+    fields: ["identifier", "title", "mediatype", "date", "downloads", "publicdate"]
+    max_items: 15
+
+transforms:
+  - type: "deduplicate"
+    name: "dedup_identifiers"
+    params:
+      field: "identifier"
+
+sinks:
+  - type: "sqlite"
+    name: "catalog_db"
+    params:
+      db_path: "./data/harvested_catalog.db"
+      table: "nasa_images"
+  - type: "jsonl"
+    name: "manifest_export"
+    params:
+      file_path: "./data/harvested_catalog.jsonl"
+  - type: "console"
+    name: "output_console"
+    params: {}

@@ -1,0 +1,38 @@
+# Credentials & Secrets (NEVER COMMIT)
+Internet Archive S3 access.txt
+jina-api-key.txt
+*.key
+*.pem
+.env
+.env.*
+
+# Python virtual environment & bytecode
+.venv/
+__pycache__/
+*.py[cod]
+*$py.class
+.pytest_cache/
+
+# DuckDB runtime extensions & temporary files
+.duckdb/
+*.duckdb.wal
+*.duckdb.tmp
+
+# Mutable runtime databases, logs, and mirrors
+data/*.db
+data/*.db-journal
+data/*.db-wal
+data/*.db-shm
+data/*.sqlite
+data/*.sqlite-journal
+data/*.sqlite-wal
+data/*.jsonl
+data/*.duckdb
+data/text_cache/
+data/active_key_index.txt
+data/mirrors/
+downloads/
+
+# Node.js
+node_modules/
+npm-debug.log*

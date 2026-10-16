@@ -1,0 +1,37 @@
+name: "wayback-archiver-pipeline"
+description: "Batch preserve URLs to Wayback Machine Save Page Now with capture verification"
+concurrency: 2
+batch_size: 10
+max_items: 20
+resume: true
+state_db: "./data/pipeline_state.db"
+
+source:
+  type: "url_list"
+  name: "seed_urls"
+  params:
+    urls:
+      - "https://www.eff.org"
+      - "https://www.gnu.org"
+      - "https://www.fsf.org"
+      - "https://www.w3.org"
+
+transforms:
+  - type: "deduplicate"
+    name: "dedup_urls"
+    params:
+      field: "url"
+
+sinks:
+  - type: "spn"
+    name: "wayback_spn"
+    params:
+      capture_all: true
+      wait_completion: false
+  - type: "jsonl"
+    name: "archival_manifest"
+    params:
+      file_path: "./data/wayback_archival_log.jsonl"
+  - type: "console"
+    name: "log_terminal"
+    params: {}
