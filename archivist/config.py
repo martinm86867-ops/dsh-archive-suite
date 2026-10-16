@@ -148,6 +148,33 @@ class ArchivistConfig:
             except Exception:
                 pass
 
+        # 4. Check for PatronSession cookies (IA_PATRON_COOKIE, patron_cookie.txt, or ~/.ia)
+        patron_cookie = (os.getenv("IA_PATRON_COOKIE") or os.getenv("ARCHIVIST_PATRON_COOKIE") or "").strip()
+        if not patron_cookie:
+            for candidate_dir in [base_dir, pkg_root, *base_dir.parents]:
+                cookie_file = candidate_dir / "patron_cookie.txt"
+                if cookie_file.is_file():
+                    try:
+                        patron_cookie = cookie_file.read_text(encoding="utf-8").strip()
+                        if patron_cookie:
+                            break
+                    except Exception:
+                        pass
+        if not patron_cookie and home_ia.is_file():
+            try:
+                import configparser
+                parser = configparser.ConfigParser()
+                parser.read(home_ia)
+                if "cookies" in parser:
+                    u = parser["cookies"].get("logged-in-user")
+                    s = parser["cookies"].get("logged-in-sig")
+                    if u and s:
+                        patron_cookie = f"logged-in-user={u}; logged-in-sig={s}"
+            except Exception:
+                pass
+        if patron_cookie:
+            config.patron_session = PatronSession(cookie=patron_cookie)
+
         config.data_dir.mkdir(parents=True, exist_ok=True)
         return config
 

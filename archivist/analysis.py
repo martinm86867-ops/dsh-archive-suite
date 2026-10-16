@@ -531,15 +531,27 @@ class CorpusAnalysis:
             if avail.get("state") == "restricted" or avail.get("restricted"):
                 if len(restricted_quotes) < 1:
                     try:
-                        q_res = await self.engine.quote_from_index(ident, probe_terms[:3], delay=0.2, size=3)
-                        if q_res.get("passages"):
-                            restricted_quotes.append({
-                                "identifier": ident,
-                                "tier": (q_res.get("item") or {}).get("tier", "T2"),
-                                "page_scope": (q_res.get("item") or {}).get("page_scope", "item_aggregate"),
-                                "url": f"https://archive.org/details/{ident}",
-                                "passages": q_res["passages"][:4],
-                            })
+                        borrowed = await self.engine.auto_borrow_and_cache(ident, terms=probe_terms[:4])
+                        if borrowed.get("status") in ("borrowed_and_cached", "fts_borrowed_and_cached", "cached"):
+                            b_txt = borrowed.get("text") or ""
+                            if b_txt and not self.corpus.has(ident):
+                                self.corpus.add_document(
+                                    ident,
+                                    b_txt,
+                                    fmt="Borrowed / FTS Cached",
+                                    source_url=f"https://archive.org/details/{ident}",
+                                )
+                            if borrowed.get("passages"):
+                                restricted_quotes.append({
+                                    "identifier": ident,
+                                    "tier": (borrowed.get("item") or {}).get("tier", "T2"),
+                                    "page_scope": (borrowed.get("item") or {}).get("page_scope", "item_aggregate"),
+                                    "loan_status": borrowed.get("loan_status"),
+                                    "url": f"https://archive.org/details/{ident}",
+                                    "passages": borrowed["passages"][:4],
+                                })
+                            elif b_txt:
+                                harvested_ids.append(ident)
                     except Exception:
                         pass
                 continue

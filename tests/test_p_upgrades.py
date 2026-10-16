@@ -266,3 +266,77 @@ async def test_agent_archive_bridge_offline(tmp_path):
 
     wh.close()
 
+
+# --- Persistent Metadata Cache, Artifact Registry & Auto-Borrow Tests -----
+
+@pytest.mark.asyncio
+async def test_metadata_cache_and_auto_borrow_caching(tmp_path):
+    from archivist.textstore import TextStore
+
+    store = TextStore(tmp_path / "cache")
+    sample_meta = {
+        "item_size": 102400,
+        "metadata": {
+            "title": "Observing Systems",
+            "creator": "Heinz von Foerster",
+            "date": "1984",
+            "mediatype": "texts",
+            "collection": ["inlibrary", "printdisabled"],
+        },
+        "files": [{"name": "obs_hocr.html", "format": "hOCR"}],
+    }
+    store.put_metadata("observingsystems0000vonf", sample_meta)
+    cached_meta = store.get_metadata("observingsystems0000vonf")
+    assert cached_meta is not None
+    assert cached_meta["metadata"]["title"] == "Observing Systems"
+
+    entries = store.metadata_entries()
+    assert len(entries) == 1
+    assert entries[0]["restricted"] == 1
+
+    # Test auto_borrow_and_cache on a lending-restricted item
+    mock_client = MagicMock()
+    mock_client.config = ArchivistConfig(data_dir=tmp_path, text_cache=True, text_cache_dir=tmp_path / "cache")
+    mock_client.get_metadata = AsyncMock(return_value=sample_meta)
+
+    engine = FullTextEngine(mock_client, cache_dir=tmp_path / "cache")
+    engine.lending_status = AsyncMock(return_value={
+        "identifier": "observingsystems0000vonf",
+        "observed_as": "anonymous",
+        "is_lendable": True,
+        "available_to_browse": True,
+        "available_to_borrow": False,
+        "loan_held": False,
+    })
+    engine.quote_from_index = AsyncMock(return_value={
+        "identifier": "observingsystems0000vonf",
+        "passage_count": 2,
+        "item": {"tier": "T2", "page_scope": "item_aggregate", "page": 362},
+        "passages": [
+            {"term": "cybernetics", "text": "Second order cybernetics is the cybernetics of observing systems and self-reference."},
+            {"term": "eigenform", "text": "Objects are tokens for eigenbehaviors in recursive observing systems."},
+        ],
+    })
+
+    borrowed = await engine.auto_borrow_and_cache("observingsystems0000vonf", terms=["cybernetics", "eigenform"])
+    assert borrowed["status"] == "fts_borrowed_and_cached"
+    assert borrowed["passage_count"] == 2
+    assert store.has("observingsystems0000vonf") is True
+
+    # Verify artifact was recorded
+    arts = store.artifacts(identifier="observingsystems0000vonf")
+    assert len(arts) == 1
+    assert arts[0]["kind"] == "borrowed_fts_digest"
+
+    # Second call serves directly from local cache without network FTS query
+    borrowed_2 = await engine.auto_borrow_and_cache("observingsystems0000vonf")
+    assert borrowed_2["status"] == "cached"
+    assert borrowed_2["cached"] is True
+
+    # Discard removes text, metadata, and artifact records
+    store.discard("observingsystems0000vonf")
+    assert store.has("observingsystems0000vonf") is False
+    assert store.get_metadata("observingsystems0000vonf") is None
+    assert len(store.artifacts(identifier="observingsystems0000vonf")) == 0
+
+

@@ -1590,6 +1590,75 @@ ${wins || '  (no high-density conceptual alignments found)'}
     }
   })
 
+  // 44. archive_cache_manage
+  ctx.tools.register({
+    name: 'archive_cache_manage',
+    description: 'Manage the local Archive.org cache (metadata, gzipped texts, auto-borrowed lending items, and downloaded media/IIIF artifacts). Operations: `stats` (summary counts and sizes), `list` (list cached texts, metadata, and artifacts), `inspect` (inspect cached metadata, text preview, and artifacts for one identifier), `borrow_and_cache` (automatically borrow a lending-restricted item or mine its FTS passages and cache/index it locally), `delete` (delete cached text, metadata, artifacts, and corpus rows for an identifier), or `sync_corpus` (rebuild DuckDB corpus from all cached texts).',
+    output: OUT,
+    parameters: {
+      type: 'object',
+      properties: {
+        operation: {
+          type: 'string',
+          enum: ['stats', 'list', 'inspect', 'borrow_and_cache', 'delete', 'sync_corpus'],
+          description: 'Cache management operation to run (default: "stats")'
+        },
+        identifier: { type: 'string', description: 'Target Archive.org identifier or artifact ID (for inspect, borrow_and_cache, delete, or filtered list)' },
+        kind: { type: 'string', description: 'Optional artifact kind filter for list (e.g. "text_derivative", "borrowed_fts_digest", "borrowed_text", "media_download", "iiif_image")' },
+        terms: {
+          type: 'array',
+          items: { type: 'string' },
+          description: 'Optional focus terms to mine when borrowing/caching a lending-restricted item'
+        },
+        patron_cookie: { type: 'string', description: 'Optional Archive.org patron session cookie override for borrowing' },
+        limit: { type: 'integer', description: 'Maximum rows to list (default: 25)' }
+      },
+      required: ['operation']
+    },
+    async execute(args) {
+      const res = await runBridge('cache_manage', args)
+      if (res.error) return `Cache Management Error: ${res.error}`
+      const op = args.operation || 'stats'
+      if (op === 'stats') {
+        const byKind = (res.artifacts_by_kind || []).map(k => `  - \`${k.kind}\`: ${k.count} items (${(k.bytes / 1024).toFixed(1)} KB)`).join('\n')
+        return `### Local Archive Cache & Artifact Registry (\`${res.root}\`)
+- **Cached Texts**: ${res.texts_cached} works (${(res.texts_total_chars / 1024).toFixed(1)} KB uncompressed)
+- **Cached Item Metadata**: ${res.metadata_cached} items (${res.restricted_items_tracked} lending-restricted tracked)
+- **Registered Artifacts**: ${res.artifacts_cached} files (${(res.artifacts_total_bytes / 1024).toFixed(1)} KB)
+${byKind ? `- **Artifacts by Kind**:\n${byKind}\n` : ''}${res.corpus ? `- **DuckDB Corpus**: ${res.corpus.documents} docs (${res.corpus.tokens} tokens, ${res.corpus.shingles} shingles)` : ''}`
+      }
+      if (op === 'list') {
+        const s = res.summary || {}
+        const tRows = (res.texts || []).slice(0, 15).map(t => `  - **${t.identifier}** (\`${t.format}\`, ${t.chars} chars, sha256:\`${(t.sha256 || '').slice(0, 10)}\`, fetched ${(t.fetched_at || '').slice(0, 19)})`).join('\n')
+        const mRows = (res.metadata || []).slice(0, 10).map(m => `  - **${m.identifier}**: *${m.title}* (${m.mediatype}, ${m.files_count} files${m.restricted ? ', [LENDING-RESTRICTED]' : ''})`).join('\n')
+        const aRows = (res.artifacts || []).slice(0, 15).map(a => `  - [${a.kind}] \`${a.identifier}\` / \`${a.file_name}\` (${(a.size_bytes / 1024).toFixed(1)} KB, status: \`${a.loan_status}\`, path: \`${a.local_path}\`)`).join('\n')
+        return `### Local Cache Inventory (${s.texts_cached || 0} texts, ${s.metadata_cached || 0} metadata records, ${s.artifacts_cached || 0} artifacts)
+#### Cached Texts:
+${tRows || '  (none)'}
+
+#### Cached Metadata:
+${mRows || '  (none)'}
+
+#### Cached Artifacts & Borrowed Works:
+${aRows || '  (none)'}`
+      }
+      if (op === 'borrow_and_cache') {
+        return `### Auto-Borrow & Local Cache Result: \`${res.identifier}\`
+- **Title**: *${res.title || res.identifier}*
+- **Status**: \`${res.status}\` (Loan Mode: \`${res.loan_status || 'n/a'}\`)
+- **Cached Characters**: ${res.chars || 0} chars (${res.passage_count || 0} passages)
+- **Local Path**: \`${res.cached_path || 'N/A'}\`
+*Work is now cached in TextStore and indexed in the local DuckDB corpus for offline analysis.*`
+      }
+      if (op === 'delete') {
+        return `### Deleted Cached Content for \`${res.identifier}\`
+- **Removed Text**: ${res.deleted_text} | **Removed Artifacts**: ${res.deleted_artifacts} | **Removed from Corpus**: ${res.removed_from_corpus}
+- **Remaining Cache**: ${res.summary?.texts_cached || 0} texts, ${res.summary?.artifacts_cached || 0} artifacts`
+      }
+      return `### Cache Operation (\`${op}\`)\n\`\`\`json\n${JSON.stringify(res, null, 2).slice(0, 2500)}\n\`\`\``
+    }
+  })
+
   // Inject system prompt guidance and bundled archivist-research-agent skill when services are present
   if (typeof ctx.inject === 'function') {
     ctx.inject(['systemPrompt'], (pctx) => {
@@ -1668,6 +1737,26 @@ ${wins || '  (no high-density conceptual alignments found)'}
               try {
                 const body = JSON.parse(raw || '{}')
                 const out = await executeObservatoryRun(runBridge, body)
+                res.writeHead(200, { 'Content-Type': 'application/json' })
+                res.end(JSON.stringify({ ok: true, result: out }))
+              } catch (err) {
+                res.writeHead(500, { 'Content-Type': 'application/json' })
+                res.end(JSON.stringify({ ok: false, error: String((err && err.message) || err) }))
+              }
+            })
+          },
+        })
+        wctx.webServer.register({
+          kind: 'exact',
+          path: '/api/dsh-archive/cache',
+          handler: async (req, res) => {
+            if (req.method !== 'POST') { res.writeHead(405); res.end(); return }
+            let raw = ''
+            req.on('data', (c) => { raw += c.toString('utf8') })
+            req.on('end', async () => {
+              try {
+                const body = JSON.parse(raw || '{}')
+                const out = await runBridge('cache_manage', body, 60000, { skipTelemetry: true })
                 res.writeHead(200, { 'Content-Type': 'application/json' })
                 res.end(JSON.stringify({ ok: true, result: out }))
               } catch (err) {

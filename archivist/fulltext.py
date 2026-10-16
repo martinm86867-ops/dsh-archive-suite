@@ -277,11 +277,23 @@ class FullTextEngine:
         self._fts_cache_ttl: float = 300.0
 
     async def _metadata(self, identifier: str) -> Dict[str, Any]:
-        """Metadata for an item, fetched once per engine instance."""
+        """Metadata for an item, persisted in the local SQLite cache across processes."""
         base_id = identifier.split("|")[0]
-        if base_id not in self._meta_cache:
-            self._meta_cache[base_id] = await self.client.get_metadata(base_id)
-        return self._meta_cache[base_id]
+        if base_id in self._meta_cache:
+            return self._meta_cache[base_id]
+        if getattr(self.client.config, "text_cache", True):
+            persisted = self.store.get_metadata(base_id)
+            if persisted is not None:
+                self._meta_cache[base_id] = persisted
+                return persisted
+        fetched = await self.client.get_metadata(base_id)
+        self._meta_cache[base_id] = fetched
+        if getattr(self.client.config, "text_cache", True):
+            try:
+                self.store.put_metadata(base_id, fetched)
+            except Exception:
+                pass
+        return fetched
 
     # -- level 1: cross-corpus discovery -----------------------------------
 
@@ -586,10 +598,174 @@ class FullTextEngine:
             return {
                 "identifier": identifier,
                 "status": "success" if resp.status_code == 200 else f"http_{resp.status_code}",
+                "action": action,
                 "response": resp.json() if resp.headers.get("content-type", "").startswith("application/json") else resp.text[:200],
             }
         except Exception as err:
             return {"identifier": identifier, "status": "error", "error": str(err)}
+
+    async def auto_borrow_and_cache(
+        self,
+        identifier: str,
+        terms: Optional[Sequence[str]] = None,
+        action: str = "browse_book",
+    ) -> Dict[str, Any]:
+        """Automatically borrow a lending-restricted item (when PatronSession is present)
+        and permanently cache its accessible text/passages and metadata locally.
+
+        1. Checks local TextStore first: if already cached, returns immediately.
+        2. Queries live ``lending_status`` (`BookReaderJSIA.php`).
+        3. If ``available_to_browse`` or ``available_to_borrow`` and a ``PatronSession``
+           cookie is configured, automatically executes ``borrow_item(identifier, action)``.
+        4. If the loan unlocks full-text / BookReader access, fetches and stores the text;
+           otherwise (or when running anonymously without a patron cookie), mines verbatim
+           passages via ``quote_from_index`` and caches the synthesized passage bundle
+           into ``TextStore`` (both ``texts`` and ``artifacts`` tables) so future queries
+           and corpus searches work 100% offline.
+        """
+        base_id = identifier.split("|")[0]
+        meta = await self._metadata(base_id)
+        m = meta.get("metadata") or {}
+        title = m.get("title") or base_id
+
+        cached_text = self.store.get(base_id)
+        if cached_text is not None and len(cached_text) >= 200:
+            return {
+                "identifier": base_id,
+                "title": title,
+                "status": "cached",
+                "loan_status": "cached_locally",
+                "chars": len(cached_text),
+                "text": cached_text,
+                "cached": True,
+            }
+
+        l_status = await self.lending_status(base_id)
+        loan_result = None
+        patron = getattr(self.client.config, "patron_session", None)
+
+        if (
+            patron and patron.cookie
+            and not l_status.get("loan_held")
+            and (l_status.get("available_to_browse") or l_status.get("available_to_borrow") or l_status.get("is_lendable"))
+        ):
+            chosen_action = "borrow_book" if l_status.get("available_to_borrow") and action == "borrow_book" else "browse_book"
+            loan_result = await self.borrow_item(base_id, action=chosen_action)
+            if loan_result.get("status") == "success":
+                l_status["loan_held"] = True
+                l_status["auto_borrowed"] = chosen_action
+
+        # If a loan is held (or patron session is active), try fetching the text derivative with patron cookies
+        if patron and patron.cookie and l_status.get("loan_held"):
+            files = meta.get("files") or []
+            for fmt, suffix, is_gzip in _TEXT_DERIVATIVES:
+                name = next((f.get("name") for f in files if f.get("format") == fmt and str(f.get("name", "")).endswith(suffix)), None)
+                if not name:
+                    continue
+                url = f"{DOWNLOAD_URL}/{base_id}/{quote(name)}"
+                try:
+                    session = await self.client.get_session()
+                    resp = await session.get(url, headers=patron.cookie_headers())
+                    if resp.status_code == 200 and len(resp.content) > 200:
+                        raw = gzip.decompress(resp.content) if is_gzip else resp.content
+                        text = raw.decode("utf-8", errors="ignore")
+                        rec = self.store.put(base_id, text, file_name=name, fmt=f"{fmt} (borrowed)", source_url=url)
+                        self.store.record_artifact(
+                            identifier=base_id,
+                            kind="borrowed_text",
+                            file_name=name,
+                            fmt=fmt,
+                            size_bytes=len(text),
+                            sha256=rec["sha256"],
+                            source_url=url,
+                            local_path=rec["cached_path"],
+                            loan_status="borrowed_active_loan",
+                            metadata={"title": title, "lending_status": l_status, "loan_result": loan_result},
+                        )
+                        return {
+                            "identifier": base_id,
+                            "title": title,
+                            "status": "borrowed_and_cached",
+                            "loan_status": "borrowed_active_loan",
+                            "chars": len(text),
+                            "text": text,
+                            "cached_path": rec["cached_path"],
+                            "cached": False,
+                        }
+                except Exception:
+                    pass
+
+        # Fallback: Mine verbatim passages from the FTS index and persist them into TextStore & artifacts
+        probe_terms = list(terms) if terms else []
+        if not probe_terms:
+            cand = []
+            if isinstance(title, str):
+                cand.extend(re.findall(r"[A-Za-z]{4,}", title)[:4])
+            subjs = m.get("subject") or []
+            if isinstance(subjs, str):
+                subjs = [subjs]
+            for s in subjs:
+                cand.extend(re.findall(r"[A-Za-z]{4,}", str(s))[:2])
+            probe_terms = list(dict.fromkeys(cand))[:5] or ["introduction", "chapter", "theory", "system"]
+
+        q_res = await self.quote_from_index(base_id, probe_terms, delay=0.2, size=5)
+        passages = q_res.get("passages") or []
+        if passages:
+            header = (
+                f"# CACHED LENDING-RESTRICTED WORK: {title} ({base_id})\n"
+                f"# Lending Status: lendable={l_status.get('is_lendable')}, browse={l_status.get('available_to_browse')}, "
+                f"observed_as={l_status.get('observed_as')}\n"
+                f"# Page Scope: {(q_res.get('item') or {}).get('page_scope', 'item_aggregate')}\n\n"
+            )
+            body = "\n\n".join(f"[{p['term']}] {p['text']}" for p in passages)
+            synthesized = header + body
+            rec = self.store.put(
+                base_id,
+                synthesized,
+                file_name=f"{base_id}_fts_borrowed.txt",
+                fmt="FTS Borrowed Digest",
+                source_url=f"https://archive.org/details/{base_id}",
+            )
+            self.store.record_artifact(
+                identifier=base_id,
+                kind="borrowed_fts_digest",
+                file_name=f"{base_id}_fts_borrowed.txt",
+                fmt="FTS Borrowed Digest",
+                size_bytes=len(synthesized),
+                sha256=rec["sha256"],
+                source_url=f"https://archive.org/details/{base_id}",
+                local_path=rec["cached_path"],
+                loan_status="fts_cached_digest" if not loan_result else f"loan_{loan_result.get('status')}",
+                metadata={
+                    "title": title,
+                    "passage_count": len(passages),
+                    "terms_mined": probe_terms,
+                    "lending_status": l_status,
+                    "loan_result": loan_result,
+                },
+            )
+            return {
+                "identifier": base_id,
+                "title": title,
+                "status": "fts_borrowed_and_cached",
+                "loan_status": l_status.get("auto_borrowed") or "fts_cached_digest",
+                "passage_count": len(passages),
+                "chars": len(synthesized),
+                "text": synthesized,
+                "passages": passages,
+                "item": q_res.get("item") or {},
+                "lending_status": l_status,
+                "cached_path": rec["cached_path"],
+                "cached": False,
+            }
+
+        return {
+            "identifier": base_id,
+            "title": title,
+            "status": "unavailable",
+            "lending_status": l_status,
+            "loan_result": loan_result,
+        }
 
     async def return_item(self, identifier: str) -> Dict[str, Any]:
         """Return an active digital loan for an item."""
@@ -970,7 +1146,19 @@ class FullTextEngine:
                     raise ArchiveError(f"{base_id}: could not decompress {name}: {err}") from err
 
             text = raw.decode("utf-8", errors="ignore")
-            self.store.put(base_id, text, file_name=name, fmt=fmt, source_url=url)
+            rec = self.store.put(base_id, text, file_name=name, fmt=fmt, source_url=url)
+            self.store.record_artifact(
+                identifier=base_id,
+                kind="text_derivative",
+                file_name=name,
+                fmt=fmt,
+                size_bytes=len(text),
+                sha256=rec["sha256"],
+                source_url=url,
+                local_path=rec["cached_path"],
+                loan_status="open",
+                metadata={"title": (meta.get("metadata") or {}).get("title", base_id)},
+            )
             return {
                 "identifier": base_id, "found": True, "file": name, "format": fmt,
                 "text": text[:cap], "chars": len(text), "truncated": len(text) > cap,
@@ -1421,12 +1609,20 @@ class FullTextEngine:
         max_docs: Optional[int] = None,
         pause: float = 1.0,
         max_chars: Optional[int] = None,
+        auto_borrow: bool = True,
+        terms: Optional[Sequence[str]] = None,
     ) -> Dict[str, Any]:
         """Download and store text for a list of items, once, politely.
 
         The only place that should do bulk downloads. Skips items already
         stored, so it is resumable. ``pause`` inserts a delay between downloads:
         bulk acquisition is where rate limits are hit.
+
+        When ``auto_borrow=True`` (default), lending-restricted items that
+        refuse direct derivative download (HTTP 401/403) are automatically
+        routed through ``auto_borrow_and_cache()`` so their borrowed text or
+        FTS passage digest is permanently cached in ``TextStore`` and indexed
+        into the local corpus.
         """
         harvested: List[Dict[str, Any]] = []
         already: List[str] = []
@@ -1444,9 +1640,39 @@ class FullTextEngine:
             try:
                 result = await self.fetch_text(base, max_chars=max_chars)
             except ArchiveError as err:
+                if auto_borrow and ("401" in str(err) or "403" in str(err) or "restricted" in str(err).lower() or "denied" in str(err).lower()):
+                    try:
+                        borrowed = await self.auto_borrow_and_cache(base, terms=terms)
+                        if borrowed.get("status") in ("borrowed_and_cached", "fts_borrowed_and_cached", "cached"):
+                            harvested.append({
+                                "identifier": base,
+                                "chars": borrowed.get("chars", 0),
+                                "format": "Borrowed / FTS Cached Digest",
+                                "file": f"{base}_fts_borrowed.txt",
+                                "loan_status": borrowed.get("loan_status"),
+                            })
+                            downloads += 1
+                            continue
+                    except Exception:
+                        pass
                 failed.append({"identifier": base, "reason": str(err)})
                 continue
             if not result["found"]:
+                if auto_borrow:
+                    try:
+                        borrowed = await self.auto_borrow_and_cache(base, terms=terms)
+                        if borrowed.get("status") in ("borrowed_and_cached", "fts_borrowed_and_cached", "cached"):
+                            harvested.append({
+                                "identifier": base,
+                                "chars": borrowed.get("chars", 0),
+                                "format": "Borrowed / FTS Cached Digest",
+                                "file": f"{base}_fts_borrowed.txt",
+                                "loan_status": borrowed.get("loan_status"),
+                            })
+                            downloads += 1
+                            continue
+                    except Exception:
+                        pass
                 failed.append({"identifier": base, "reason": result.get("reason", "no text")})
                 continue
             harvested.append({"identifier": base, "chars": result["chars"],

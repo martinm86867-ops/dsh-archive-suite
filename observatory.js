@@ -416,6 +416,12 @@ export function renderObservatoryHtml() {
       <div id="runList">Loading telemetry...</div>
       <h2 style="margin-top:18px;">📚 Indexed DuckDB Corpus Works</h2>
       <div id="corpusList"></div>
+      <h2 style="margin-top:18px; display:flex; justify-content:space-between; align-items:center;">
+        <span>🗄️ Local Cache & Borrowed Artifacts</span>
+        <button style="height:24px; font-size:11px; padding:0 8px;" onclick="syncCorpus()">Sync Corpus</button>
+      </h2>
+      <div id="cacheSummary" style="font-size:11px; color:var(--muted); font-family:monospace; margin-bottom:8px;"></div>
+      <div id="cacheList"></div>
     </div>
 
     <div class="panel" id="detailPanel">
@@ -453,6 +459,33 @@ export function renderObservatoryHtml() {
         document.getElementById('corpusList').innerHTML = data.corpus_docs.map(d =>
           \`<a class="corpus-tag" href="https://archive.org/details/\${d.identifier}" target="_blank" title="OCR Quality: \${d.ocr_quality}">\${d.identifier} (\${Math.round(d.tokens/1000)}k tok)</a>\`
         ).join('');
+      }
+      if (data.cache) {
+        const s = data.cache.summary || {};
+        document.getElementById('cacheSummary').textContent =
+          \`Texts: \${s.texts_cached || 0} (\${Math.round((s.texts_total_chars || 0)/1024)} KB) · Metadata: \${s.metadata_cached || 0} (Restricted: \${s.restricted_items_tracked || 0}) · Artifacts: \${s.artifacts_cached || 0}\`;
+        const texts = data.cache.texts || [];
+        const arts = data.cache.artifacts || [];
+        const itemsHtml = texts.slice(0, 15).map(t => \`
+          <div style="display:flex; justify-content:space-between; align-items:center; padding:6px 8px; margin-bottom:5px; background:var(--panel-alt); border:1px solid var(--border); border-radius:6px; font-size:11px;">
+            <div style="min-width:0; flex:1;">
+              <a href="https://archive.org/details/\${escapeHtml(t.identifier)}" target="_blank" style="font-family:monospace; font-weight:600;">\${escapeHtml(t.identifier)}</a>
+              <span style="color:var(--muted); margin-left:6px;">(\${escapeHtml(t.format || 'txt')}, \${Math.round((t.chars || 0)/1024)} KB)</span>
+            </div>
+            <button style="height:22px; font-size:10px; padding:0 8px; background:var(--red); color:#fff; margin-left:8px;" onclick="deleteCachedItem('\${escapeHtml(t.identifier)}')">Delete</button>
+          </div>
+        \`).join('');
+        const artsHtml = arts.slice(0, 10).map(a => \`
+          <div style="display:flex; justify-content:space-between; align-items:center; padding:5px 8px; margin-bottom:4px; background:#080b11; border:1px solid var(--border); border-radius:6px; font-size:11px;">
+            <div style="min-width:0; flex:1;">
+              <span class="tier-badge tier-T2">\${escapeHtml(a.kind)}</span>
+              <span style="font-family:monospace;">\${escapeHtml(a.identifier)}/\${escapeHtml(a.file_name)}</span>
+              <span style="color:var(--muted);">[\${escapeHtml(a.loan_status || 'open')}]</span>
+            </div>
+            <button style="height:20px; font-size:10px; padding:0 6px; background:var(--red); color:#fff;" onclick="deleteCachedItem('\${escapeHtml(a.id)}')">Del</button>
+          </div>
+        \`).join('');
+        document.getElementById('cacheList').innerHTML = (itemsHtml + artsHtml) || '<div style="font-size:11px; color:var(--muted);">Cache empty.</div>';
       }
 
       renderRunList();
@@ -615,6 +648,24 @@ export function renderObservatoryHtml() {
       return String(s || '').replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;').replace(/"/g, '&quot;');
     }
 
+    async function deleteCachedItem(identifier) {
+      await fetch(apiBase + '/cache', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ operation: 'delete', identifier })
+      });
+      await loadTelemetry();
+    }
+
+    async function syncCorpus() {
+      await fetch(apiBase + '/cache', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ operation: 'sync_corpus' })
+      });
+      await loadTelemetry();
+    }
+
     loadTelemetry();
   </script>
 </body>
@@ -627,6 +678,7 @@ export async function buildTelemetryPayload(runBridgeFn) {
   let corpus = null
   let corpus_docs = []
   let warehouse = null
+  let cache = null
   try {
     corpus = await runBridgeFn('corpus_stats', {}, 15000, { skipTelemetry: true })
     const sqlRes = await runBridgeFn('corpus_sql', {
@@ -641,11 +693,15 @@ export async function buildTelemetryPayload(runBridgeFn) {
   } catch { /* optional */ }
 
   try {
+    cache = await runBridgeFn('cache_manage', { operation: 'list', limit: 25 }, 15000, { skipTelemetry: true })
+  } catch { /* optional */ }
+
+  try {
     const whRes = await runBridgeFn('research_search', { query: 'system', limit: 1 }, 15000, { skipTelemetry: true })
     warehouse = whRes.warehouse_stats || null
   } catch { /* optional */ }
 
-  return { runs, corpus, corpus_docs, warehouse }
+  return { runs, corpus, corpus_docs, warehouse, cache }
 }
 
 /** Execute a query initiated from the Observatory UI and record its telemetry. */
@@ -689,6 +745,22 @@ export function startStandaloneObservatory(runBridgeFn, port = Number(process.en
         try {
           const body = JSON.parse(raw || '{}')
           const out = await executeObservatoryRun(runBridgeFn, body)
+          res.writeHead(200, { 'Content-Type': 'application/json' })
+          res.end(JSON.stringify({ ok: true, result: out }))
+        } catch (err) {
+          res.writeHead(500, { 'Content-Type': 'application/json' })
+          res.end(JSON.stringify({ ok: false, error: String((err && err.message) || err) }))
+        }
+      })
+      return
+    }
+    if (req.method === 'POST' && (url.pathname === '/cache' || url.pathname === '/api/dsh-archive/cache')) {
+      let raw = ''
+      req.on('data', (c) => { raw += c.toString('utf8') })
+      req.on('end', async () => {
+        try {
+          const body = JSON.parse(raw || '{}')
+          const out = await runBridgeFn('cache_manage', body, 60000, { skipTelemetry: true })
           res.writeHead(200, { 'Content-Type': 'application/json' })
           res.end(JSON.stringify({ ok: true, result: out }))
         } catch (err) {

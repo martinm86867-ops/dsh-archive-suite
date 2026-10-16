@@ -64,12 +64,14 @@ async def handle_search(args: dict) -> dict:
 
 
 async def handle_item_info(args: dict) -> dict:
+    from archivist.fulltext import FullTextEngine
     ident = args["identifier"]
     max_files = int(args.get("max_files", 25))
     format_filter = (args.get("format_filter") or "").lower().strip()
     cfg = ArchivistConfig.load(search_dir=WORKSPACE_ARCHIVE)
     async with ArchiveClient(cfg) as client:
-        meta = await client.get_metadata(ident)
+        ft = FullTextEngine(client)
+        meta = await ft._metadata(ident)
         files = meta.get("files", [])
         if format_filter:
             files = [f for f in files if format_filter in str(f.get("format", "")).lower() or format_filter in str(f.get("name", "")).lower()]
@@ -88,7 +90,8 @@ async def handle_item_info(args: dict) -> dict:
             "files_count": len(meta.get("files", [])),
             "filtered_files_count": len(files),
             "url": f"https://archive.org/details/{ident}",
-            "sample_files": files[:max_files]
+            "sample_files": files[:max_files],
+            "cached_in_store": True,
         }
 
 
@@ -218,13 +221,25 @@ async def handle_media_read_text(args: dict) -> dict:
             file_url = fetched.get("source_url", f"https://archive.org/download/{ident}/{filename}")
         else:
             engine = MediaAccessEngine(client)
-            res = await engine.read_full_text(ident, max_chars=offset + max_chars)
+            try:
+                res = await engine.read_full_text(ident, max_chars=offset + max_chars)
+            except ArchiveError:
+                res = {"found": False}
             if not res.get("found"):
-                return res
-            full_text = res["text"]
-            total_chars = len(full_text)
-            filename = res["filename"]
-            file_url = res["full_file_url"]
+                # Auto-borrow & cache when item is lending-restricted
+                borrowed = await ft.auto_borrow_and_cache(ident, terms=[pattern] if pattern else None)
+                if borrowed.get("text"):
+                    full_text = borrowed["text"]
+                    total_chars = len(full_text)
+                    filename = f"{ident}_fts_borrowed.txt"
+                    file_url = f"https://archive.org/details/{ident}"
+                else:
+                    return res
+            else:
+                full_text = res["text"]
+                total_chars = len(full_text)
+                filename = res["filename"]
+                file_url = res["full_file_url"]
 
         if pattern:
             matches = []
@@ -291,18 +306,42 @@ async def handle_media_book_search(args: dict) -> dict:
 
 
 async def handle_media_download(args: dict) -> dict:
+    import hashlib
+    from archivist.fulltext import FullTextEngine
     ident = args["identifier"]
     filename = args["filename"]
-    dest_dir = Path(args.get("destination_dir", "./downloads"))
-    dest_file = dest_dir / filename
     cfg = ArchivistConfig.load(search_dir=WORKSPACE_ARCHIVE)
+    default_dest = cfg.data_dir / "text_cache" / "artifacts" / ident
+    dest_dir = Path(args.get("destination_dir") or default_dest)
+    dest_file = dest_dir / filename
     async with ArchiveClient(cfg) as client:
+        ft = FullTextEngine(client)
+        meta = await ft._metadata(ident)
         path = await client.download_file(ident, filename, dest_file)
+        size = path.stat().st_size
+        h = hashlib.sha256()
+        with open(path, "rb") as f:
+            while chunk := f.read(512 * 1024):
+                h.update(chunk)
+        rec = ft.store.record_artifact(
+            identifier=ident,
+            kind="media_download",
+            file_name=filename,
+            fmt=Path(filename).suffix.lstrip(".") or "binary",
+            size_bytes=size,
+            sha256=h.hexdigest(),
+            source_url=f"https://archive.org/download/{ident}/{filename}",
+            local_path=str(path.resolve()),
+            loan_status="open",
+            metadata={"title": (meta.get("metadata") or {}).get("title", ident)},
+        )
         return {
             "identifier": ident,
             "filename": filename,
             "saved_path": str(path.resolve()),
-            "size": path.stat().st_size
+            "size": size,
+            "sha256": rec["sha256"],
+            "artifact_id": rec["id"],
         }
 
 
@@ -739,14 +778,30 @@ async def handle_iiif_image(args: dict) -> dict:
             info["downloaded"] = True
             info["saved_path"] = str(dest.resolve())
             info["bytes"] = len(r.content)
+            import hashlib
+            from archivist.fulltext import FullTextEngine
+            ft = FullTextEngine(client)
+            ft.store.record_artifact(
+                identifier=ident,
+                kind="iiif_image",
+                file_name=dest.name,
+                fmt=fmt,
+                size_bytes=len(r.content),
+                sha256=hashlib.sha256(r.content).hexdigest(),
+                source_url=info["iiif_url"],
+                local_path=str(dest.resolve()),
+                loan_status="open",
+                metadata={"page_number": page_number, "region": region, "size": size},
+            )
         return info
 
 
 async def handle_lending_borrow(args: dict) -> dict:
-    """Borrow, browse (1-hour loan), or return a lending-restricted item when a PatronSession cookie is configured."""
+    """Borrow, browse (1-hour loan), or return a lending-restricted item, and cache its content locally."""
     from archivist.fulltext import FullTextEngine
     ident = args["identifier"]
     action = args.get("action", "browse_book")
+    terms = args.get("terms")
     cfg = ArchivistConfig.load(search_dir=WORKSPACE_ARCHIVE)
     cookie = args.get("patron_cookie") or os.environ.get("IA_PATRON_COOKIE")
     if cookie:
@@ -756,6 +811,8 @@ async def handle_lending_borrow(args: dict) -> dict:
         engine = FullTextEngine(client)
         if action == "return_loan":
             return await engine.return_item(ident)
+        if args.get("auto_cache", True):
+            return await engine.auto_borrow_and_cache(ident, terms=terms, action=action)
         return await engine.borrow_item(ident, action=action)
 
 
@@ -846,6 +903,99 @@ async def handle_epistemic_dossier(args: dict) -> dict:
         )
 
 
+async def handle_cache_manage(args: dict) -> dict:
+    """Unified local cache & downloaded content manager (stats, list, inspect, borrow_and_cache, delete, prune, sync_corpus)."""
+    from archivist.fulltext import FullTextEngine
+    from archivist.textstore import TextStore
+    op = args.get("operation", "stats")
+    ident = args.get("identifier")
+    kind = args.get("kind")
+    limit = int(args.get("limit", 50))
+
+    cfg = ArchivistConfig.load(search_dir=WORKSPACE_ARCHIVE)
+    store = TextStore(Path(args.get("store") or (cfg.data_dir / "text_cache")))
+
+    if op == "stats":
+        summary = store.cache_summary()
+        try:
+            summary["corpus"] = _corpus_db(args).stats()
+        except Exception:
+            pass
+        return summary
+
+    if op == "list":
+        return {
+            "summary": store.cache_summary(),
+            "texts": store.entries()[:limit],
+            "metadata": store.metadata_entries(limit=limit),
+            "artifacts": store.artifacts(kind=kind, identifier=ident, limit=limit),
+        }
+
+    if op == "inspect":
+        if not ident:
+            return {"error": "identifier is required for operation='inspect'"}
+        base = ident.split("|")[0]
+        meta = store.get_metadata(base, ttl_hours=0)
+        text = store.get(base)
+        arts = store.artifacts(identifier=base)
+        return {
+            "identifier": base,
+            "has_cached_metadata": meta is not None,
+            "metadata_summary": {
+                "title": (meta.get("metadata") or {}).get("title") if meta else None,
+                "mediatype": (meta.get("metadata") or {}).get("mediatype") if meta else None,
+                "files_count": len(meta.get("files") or []) if meta else 0,
+            } if meta else None,
+            "has_cached_text": text is not None,
+            "cached_text_chars": len(text) if text else 0,
+            "cached_text_preview": text[:1200] if text else None,
+            "artifacts": arts,
+        }
+
+    if op == "borrow_and_cache":
+        if not ident:
+            return {"error": "identifier is required for operation='borrow_and_cache'"}
+        cookie = args.get("patron_cookie")
+        if cookie:
+            from archivist.config import PatronSession
+            cfg.patron_session = PatronSession(cookie=cookie)
+        async with ArchiveClient(cfg) as client:
+            ft = FullTextEngine(client)
+            res = await ft.auto_borrow_and_cache(ident, terms=args.get("terms"))
+            if res.get("text"):
+                _corpus_db(args).add_document(
+                    ident.split("|")[0],
+                    res["text"],
+                    fmt="Borrowed / FTS Cached",
+                    source_url=f"https://archive.org/details/{ident.split('|')[0]}",
+                )
+            return res
+
+    if op == "delete":
+        if not ident:
+            return {"error": "identifier (or artifact id) is required for operation='delete'"}
+        base = ident.split("|")[0]
+        existed_text = store.discard(base)
+        deleted_arts = store.delete_artifact(ident, delete_files=True)
+        try:
+            _corpus_db(args).remove_document(base)
+        except Exception:
+            pass
+        return {
+            "identifier": ident,
+            "deleted_text": existed_text,
+            "deleted_artifacts": deleted_arts,
+            "removed_from_corpus": True,
+            "summary": store.cache_summary(),
+        }
+
+    if op == "sync_corpus":
+        built = _corpus_db(args).build_from_store(store, replace=bool(args.get("replace", False)))
+        return {"operation": "sync_corpus", **built}
+
+    return {"error": f"Unknown cache_manage operation: {op}"}
+
+
 COMMANDS = {
     "search": handle_search,
     "scrape": handle_scrape,
@@ -900,6 +1050,7 @@ COMMANDS = {
     "research_timeline": handle_research_timeline,
     "forensic_compare": handle_forensic_compare,
     "epistemic_dossier": handle_epistemic_dossier,
+    "cache_manage": handle_cache_manage,
 }
 
 

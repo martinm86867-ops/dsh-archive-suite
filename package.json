@@ -1,7 +1,7 @@
 {
   "name": "@martinm86867-ops/dsh-archive-suite",
-  "version": "1.9.0",
-  "description": "Archive.org, Wayback Machine & Epistemic Fact-Checking power suite for DeepSeek Harness (43 native tools + bundled archivist-research-agent skill): works standalone or hybrid with Jina, featuring one-call epistemic & forensic dossiers (95% token reduction), primary-text shingle/window comparison, full-text OCR search, T1 primary-record claim tracing, lending-restricted FTS passage extraction, Wayback snapshot reader, IIIF image/crop extraction, DuckDB analytical corpus & warehouse, IAS3 storage, SPN2 preservation, and pipeline orchestration.",
+  "version": "1.10.0",
+  "description": "Archive.org, Wayback Machine & Epistemic Fact-Checking power suite for DeepSeek Harness (44 native tools + bundled archivist-research-agent skill + Local Observatory): works standalone or hybrid with Jina, featuring one-call epistemic & forensic dossiers (95% token reduction), auto-borrowing & local metadata/artifact caching, primary-text shingle/window comparison, full-text OCR search, T1 primary-record claim tracing, Wayback snapshot reader, IIIF image/crop extraction, DuckDB analytical corpus & warehouse, IAS3 storage, SPN2 preservation, and pipeline orchestration.",
   "type": "module",
   "main": "index.js",
   "scripts": {

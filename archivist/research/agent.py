@@ -59,7 +59,7 @@ class AgentArchiveBridge:
         tier, tier_basis = grade_item(collections)
 
         # -------------------------------------------------------------
-        # Branch 1: Lending-Restricted Work -> Mine via FTS Index
+        # Branch 1: Lending-Restricted Work -> Auto-Borrow & Cache + Mine via FTS Index
         # -------------------------------------------------------------
         if access.get("lending") or state == "restricted":
             query_terms = terms
@@ -77,14 +77,16 @@ class AgentArchiveBridge:
                     cand_terms.extend(words[:2])
                 query_terms = list(dict.fromkeys(cand_terms))[:4] or ["theory", "system"]
 
-            logger.info(f"Ingesting restricted work {ident} via FTS quote channel for terms: {query_terms}")
+            logger.info(f"Auto-borrowing and caching restricted work {ident} for terms: {query_terms}")
             try:
-                res = await self.engine.quote_from_index(ident, query_terms, delay=0.8)
+                res = await self.engine.auto_borrow_and_cache(ident, terms=query_terms)
+                if res.get("status") == "unavailable":
+                    res = await self.engine.quote_from_index(ident, query_terms, delay=0.8)
             except Exception as e:
                 return {
                     "identifier": ident,
                     "status": "error",
-                    "reason": f"FTS index query failed: {e}",
+                    "reason": f"Auto-borrow / FTS index query failed: {e}",
                     "access": access
                 }
 

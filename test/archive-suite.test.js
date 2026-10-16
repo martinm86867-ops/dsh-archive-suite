@@ -23,7 +23,7 @@ import {
 } from '../index.js'
 import { readFileSync } from 'node:fs'
 
-test('dsh-archive-suite registers all 43 tools with valid JSON Schema objects', () => {
+test('dsh-archive-suite registers all 44 tools with valid JSON Schema objects', () => {
   const registered = new Map()
   apply({
     tools: {
@@ -33,9 +33,10 @@ test('dsh-archive-suite registers all 43 tools with valid JSON Schema objects', 
     },
   })
 
-  assert.equal(registered.size, 43, `Expected 43 tools, got ${registered.size}`)
+  assert.equal(registered.size, 44, `Expected 44 tools, got ${registered.size}`)
   for (const requiredTool of [
     'archive_epistemic_dossier',
+    'archive_cache_manage',
     'archive_fact_check',
     'archive_forensic_compare',
     'archive_claim_trace',
@@ -319,5 +320,11 @@ test('observatory telemetry records tool runs, extracts sources, and mounts webS
     '/api/dsh-archive/observatory',
     '/api/dsh-archive/telemetry',
     '/api/dsh-archive/run',
+    '/api/dsh-archive/cache',
   ])
+
+  const cacheStats = await runBridge('cache_manage', { operation: 'stats' }, 15000, { skipTelemetry: true })
+  assert.equal(typeof cacheStats.texts_cached, 'number')
+  assert.equal(typeof cacheStats.metadata_cached, 'number')
+  assert.equal(typeof cacheStats.artifacts_cached, 'number')
 })
