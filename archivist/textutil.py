@@ -22,17 +22,30 @@ import re
 import zlib
 from typing import Any, Dict, List, Sequence, Tuple
 
-_TOKEN_RE = re.compile(r"[a-z0-9]+")
+_TOKEN_RE = re.compile(r"[a-z0-9\u00c0-\u024f]+")
 
 # Short list is enough: n-gram matching with n >= 6 is already selective, and
 # the shuffled null baseline absorbs whatever common phrasing remains.
+# Includes high-frequency English, French, German, and Spanish function words
+# so cross-language or non-English primary texts do not align on articles/pronouns.
 _STOPWORDS = frozenset(
     """a an the and or but if then than that this these those of to in on at by for with from
     as is are was were be been being it its his her their our your my not no nor so such we they
     he she you i will shall may might must can could would should do does did done have has had
     there here which who whom whose what when where why how all any both each few more most other
     some only own same too very just now also into over under again further once during out off
-    about against between while because until upon within without""".split()
+    about against between while because until upon within without
+    le la les un une des du de au aux ce cet cette ces mon ton son ma ta sa mes tes ses nos vos
+    leurs leur je tu il elle on nous vous ils elles me te se lui y en qui que quoi dont où
+    et ou mais donc or ni car ne pas plus moins très bien mal tout tous toute toutes même mêmes
+    autre autres dans sur sous par pour avec sans chez vers entre comme quand comme si
+    est sont était étaient fut furent sera seront soit soient avoir avait avaient eu
+    dit dire fait faire peut peuvent pouvait faut fallait voir voit
+    der die das den dem des ein eine einer eines einem einen und oder aber denn sondern
+    nicht nichts kein keine keinen Си ich du er sie es wir ihr mich dich sich uns euch
+    von zu mit auf für an in aus bei nach über unter vor hinter durch gegen ohne um
+    el los las una unos unas del al lo como más pero sus le ya o fue este ha sí porque
+    esta son entre está когда muy sin sobre ser tiene también me hasta hay donde""".split()
 )
 
 _HIGHLIGHT_RE = re.compile(
@@ -101,7 +114,8 @@ _EVALUATIVE_NOISE = frozenset(
     discredited myth myths misconception conspiracy theory theories proof
     prove proven verify verified fact check factcheck holds hold any does
     did whether indeed actually really claim claims claimed allege alleged
-    allegation purports purported""".split()
+    allegation purports purported publish published publishing write wrote
+    written author authored book paper article work document text year""".split()
 )
 
 
@@ -123,19 +137,19 @@ def extract_subject_core(statement: str) -> str:
         f'"{q}"' for q in quoted
         if not all(t in _EVALUATIVE_NOISE or t in _STOPWORDS for t in tokenize(q))
     ]
-    # Also collect non-quoted content tokens that aren't evaluative noise
+    # Also collect non-quoted content tokens that aren't evaluative noise or bare years
     unquoted_text = re.sub(r'"[^"]+"', " ", statement)
     unquoted_text = re.sub(r"\b(AND|OR|NOT)\b", " ", unquoted_text, flags=re.IGNORECASE)
     extra_toks = [
         t for t in content_tokens(unquoted_text)
-        if t not in _EVALUATIVE_NOISE
+        if t not in _EVALUATIVE_NOISE and not (t.isdigit() and len(t) == 4)
     ]
     if neutral_quoted:
-        # Keep the primary quoted anchor(s) plus up to 3 non-evaluative context tokens
+        # Keep the primary quoted anchor(s) plus up to 2 non-evaluative entity tokens
         parts = list(neutral_quoted[:2])
         anchor_toks = set(tokenize(" ".join(neutral_quoted)))
         for t in extra_toks:
-            if t not in anchor_toks and len(parts) < 4:
+            if t not in anchor_toks and len(parts) < 3:
                 parts.append(t)
         return " ".join(parts)
 
@@ -157,14 +171,19 @@ def build_triangulated_queries(statement: str) -> Dict[str, str]:
 
     IMPORTANT: Archive.org's ``ia-pub-fts-api`` treats bare spaces as implicit
     AND and rejects parenthesized ``OR`` groups when combined with ``AND``.
-    Therefore each axis pairs ``core`` with a single high-recall anchor term.
+    Therefore each axis pairs the tightest anchor (`quoted` title if present,
+    otherwise `core`) with a single high-recall anchor term so multi-term
+    compound queries do not over-constrain FTS to 0 hits.
     """
     core = extract_subject_core(statement)
+    quoted = [f'"{q.strip()}"' for q in re.findall(r'"([^"]+)"', core) if len(q.strip()) >= 4]
+    axis_base = quoted[0] if quoted else core
     return {
         "core": core,
-        "corroboration": f"{core} authentic",
-        "critique": f"{core} forgery",
-        "substance": f"{core} analysis",
+        "title_anchor": axis_base,
+        "corroboration": f"{axis_base} authentic",
+        "critique": f"{axis_base} forgery",
+        "substance": f"{axis_base} analysis",
     }
 
 

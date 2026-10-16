@@ -908,21 +908,33 @@ class FullTextEngine:
 
     # -- text acquisition --------------------------------------------------
 
-    async def fetch_text(self, identifier: str, max_chars: Optional[int] = None) -> Dict[str, Any]:
-        """Download the compact text derivative of an item into the local store."""
+    async def fetch_text(self, identifier: str, max_chars: Optional[int] = None, prefer_terms: Optional[Sequence[str]] = None) -> Dict[str, Any]:
+        """Download the compact text derivative of an item into the local store.
+
+        When an item is a multi-file compilation (e.g. a reading list containing
+        dozens of unrelated PDFs/DjVuTXTs), ``prefer_terms`` ranks candidate
+        derivative filenames so the file matching the target title/author is
+        selected rather than whichever file appears first alphabetically.
+        """
         base_id = identifier.split("|")[0]
         cap = max_chars or getattr(self.client.config, "max_text_fetch_bytes", 4_000_000)
         meta = await self._metadata(base_id)
         files = meta.get("files", []) or []
+        pref_toks = [t.lower() for t in (prefer_terms or []) if len(t) >= 3]
 
         for fmt, suffix, is_gzip in _TEXT_DERIVATIVES:
-            name = next(
-                (f.get("name") for f in files
-                 if f.get("format") == fmt and str(f.get("name", "")).endswith(suffix)),
-                None,
-            )
-            if not name:
+            candidates = [
+                f.get("name") for f in files
+                if f.get("format") == fmt and str(f.get("name", "")).endswith(suffix)
+            ]
+            if not candidates:
                 continue
+            if pref_toks and len(candidates) > 1:
+                candidates.sort(
+                    key=lambda fn: sum(1 for t in pref_toks if t in str(fn).lower()),
+                    reverse=True,
+                )
+            name = candidates[0]
 
             cached = self.store.get(base_id)
             if cached is not None:
@@ -1091,7 +1103,7 @@ class FullTextEngine:
 
             if marker:
                 stance = "denies"
-            elif cov >= 0.60:
+            elif cov >= 0.45 or (len(core_toks) >= 3 and len(core_toks & q_toks) >= 2):
                 if any(c in q_low for c in _attr_cues):
                     stance = "reports"
                     reports_cnt += 1
@@ -1149,11 +1161,12 @@ class FullTextEngine:
         triangulation: Dict[str, Any] = {}
         if triangulate and not primary_only and core_query:
             try:
+                title_anchor = axes.get("title_anchor") or core_query
                 corr_res, crit_res, subst_res, cat_res = await asyncio.gather(
                     self.search(axes["corroboration"], size=2),
                     self.search(axes["critique"], size=2),
                     self.search(axes["substance"], size=2),
-                    self.client.search(f'title:({core_query})', rows=3, sorts=["downloads desc"]),
+                    self.client.search(f'title:({title_anchor})', rows=4, sorts=["downloads desc"]),
                     return_exceptions=True,
                 )
 

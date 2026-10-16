@@ -22,6 +22,10 @@ SHARED = (
 
 def test_tokenize_is_lowercase_alphanumeric():
     assert tokenize("Hello, World! 42 times") == ["hello", "world", "42", "times"]
+    # Accented European words must remain intact rather than splitting at accents
+    assert tokenize("Les différentes sociétés chrétiennes d'État") == [
+        "les", "différentes", "sociétés", "chrétiennes", "d", "état"
+    ]
 
 
 def test_content_tokens_drops_stopwords_and_short_words():
@@ -107,4 +111,11 @@ def test_build_triangulated_queries_generates_symmetric_axes():
     assert "authentic" in axes["corroboration"]
     assert "forgery" in axes["critique"]
     assert "analysis" in axes["substance"]
+
+    # Authorship / publication questions strip verb/year framing and keep title_anchor clean
+    axes_turing = build_triangulated_queries('Did Alan Turing publish "The Chemical Basis of Morphogenesis" in 1952?')
+    assert "publish" not in axes_turing["core"]
+    assert "1952" not in axes_turing["core"]
+    assert axes_turing["title_anchor"] == '"The Chemical Basis of Morphogenesis"'
+    assert axes_turing["substance"] == '"The Chemical Basis of Morphogenesis" analysis'
 

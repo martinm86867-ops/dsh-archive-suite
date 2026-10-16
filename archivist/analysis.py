@@ -212,16 +212,22 @@ class CorpusAnalysis:
         toks_a = content_tokens(clean_a)
         toks_b = content_tokens(clean_b)
 
-        # Build inverse document frequency / rarity filter across the two texts
+        # Build inverse document frequency / rarity filter across the two texts.
+        # Filter out 3-letter OCR fragments and ensure words appear in a reasonable
+        # frequency band in BOTH texts so neither stopword leaks nor 1-off typos dominate.
         from collections import Counter
+        freq_a = Counter(toks_a)
         freq_b = Counter(toks_b)
-        # Keep distinctive content words (occurring >= 1 and <= 80 times)
         windows_b = []
         for i in range(0, max(1, len(toks_b) - window_tokens + 1), step_tokens):
             win = toks_b[i:i + window_tokens]
             if len(win) < 30:
                 continue
-            windows_b.append((i, set(w for w in win if freq_b[w] <= 80), " ".join(win[:45])))
+            windows_b.append((
+                i,
+                set(w for w in win if len(w) >= 4 and freq_b[w] <= 80 and freq_a.get(w, 0) <= 80),
+                " ".join(win[:45]),
+            ))
 
         aligned_windows = []
         if windows_b and len(toks_a) >= 30:
@@ -229,7 +235,7 @@ class CorpusAnalysis:
                 win_a = toks_a[ia:ia + window_tokens]
                 if len(win_a) < 30:
                     continue
-                set_a = set(w for w in win_a if freq_b.get(w, 0) <= 80)
+                set_a = set(w for w in win_a if len(w) >= 4 and freq_b.get(w, 0) <= 80 and freq_a[w] <= 80)
                 if len(set_a) < 8:
                     continue
                 best_j = -1
@@ -462,9 +468,32 @@ class CorpusAnalysis:
         tri = trace.get("triangulation") or {}
         core_query = trace.get("subject_core") or statement
         canonical = tri.get("canonical_editions") or []
+        core_toks = set(content_tokens(core_query))
 
-        # If catalog title search didn't find canonical editions, fall back to top FTS hit identifiers
-        candidate_ids: List[str] = [c["identifier"] for c in canonical if c.get("identifier")]
+        # Prioritize: (1) local warehouse / local corpus works whose identifier or title
+        # directly matches the subject core, (2) catalog canonical editions (`title:(...)`),
+        # and (3) top FTS evidence hits.
+        candidate_ids: List[str] = []
+        for wh_hit in trace.get("local_warehouse") or []:
+            wh_id = (wh_hit.get("identifier") or "").strip()
+            if wh_id.endswith(".txt"):
+                wh_id = wh_id[:-4]
+            if wh_id and wh_id not in candidate_ids and (self.corpus.has(wh_id) or self.engine.store.has(wh_id)):
+                candidate_ids.append(wh_id)
+
+        try:
+            for (doc_id,) in self.corpus.sql("SELECT identifier FROM documents"):
+                id_toks = set(content_tokens(doc_id.replace("-", " ").replace("_", " ")))
+                if core_toks and len(core_toks & id_toks) >= max(2, len(core_toks) // 2):
+                    if doc_id not in candidate_ids:
+                        candidate_ids.append(doc_id)
+        except Exception:
+            pass
+
+        for c in canonical:
+            ident = c.get("identifier")
+            if ident and ident not in candidate_ids:
+                candidate_ids.append(ident)
         for ev in trace.get("evidence") or []:
             ident = ev.get("identifier")
             if ident and ident not in candidate_ids:
@@ -477,15 +506,23 @@ class CorpusAnalysis:
 
         probe_terms = list(focus_terms) if focus_terms else []
         if not probe_terms:
-            toks = [t for t in content_tokens(statement) if t not in set(content_tokens(core_query))]
-            probe_terms = toks[:4] or ["introduction", "conclusion", "summary", "chapter"]
+            toks = [t for t in content_tokens(statement) if t not in core_toks]
+            probe_terms = toks[:4] or list(core_toks)[:3] or ["introduction", "conclusion", "summary"]
 
-        for ident in candidate_ids[:max_harvest + 2]:
+        for ident in candidate_ids[:max_harvest + 4]:
             if len(harvested_ids) >= max_harvest:
                 break
             if self.corpus.has(ident):
-                harvested_ids.append(ident)
-                continue
+                txt_check = (self.corpus.text(ident) or "").lower()
+                if not core_toks or any(t in txt_check for t in core_toks):
+                    harvested_ids.append(ident)
+                    continue
+            if self.engine.store.has(ident) and not self.corpus.has(ident):
+                stored_txt = self.engine.store.get(ident) or ""
+                if stored_txt and (not core_toks or any(t in stored_txt.lower() for t in core_toks)):
+                    self.corpus.add_document(ident, stored_txt, fmt="DjVuTXT")
+                    harvested_ids.append(ident)
+                    continue
             try:
                 avail = await self.engine.availability(ident)
             except Exception:
@@ -507,13 +544,20 @@ class CorpusAnalysis:
                         pass
                 continue
 
-            # Try harvesting open text derivative into store & corpus
+            # Try harvesting open text derivative into store & corpus, preferring files matching core_toks
             try:
-                fetched = await self.engine.fetch_text(ident, max_chars=600_000)
-                if fetched.get("found") and fetched.get("text") and len(fetched["text"]) >= 1500:
+                fetched = await self.engine.fetch_text(ident, max_chars=600_000, prefer_terms=list(core_toks))
+                f_txt = fetched.get("text") or ""
+                if fetched.get("found") and len(f_txt) >= 1500:
+                    # Guard against multi-file reading-list bundles where the downloaded file
+                    # is an unrelated document that does not mention any subject core terms
+                    f_low = f_txt.lower()
+                    if core_toks and not any(t in f_low for t in core_toks):
+                        continue
+                    full_stored = self.engine.store.get(ident) or f_txt
                     self.corpus.add_document(
                         ident,
-                        fetched["text"],
+                        full_stored,
                         fmt=fetched.get("format", "DjVuTXT"),
                         source_url=fetched.get("source_url", ""),
                     )
@@ -538,25 +582,34 @@ class CorpusAnalysis:
             if primary_a:
                 try:
                     forensic_report = self.forensic_compare(primary_a, compare_with, top_passages=3)
-                    diffs_a_b = self.corpus.classify_differences(primary_a, compare_with, min_run=40, max_runs=2)
-                    diffs_b_a = self.corpus.classify_differences(compare_with, primary_a, min_run=40, max_runs=2)
-                    for d in diffs_a_b[:2]:
-                        edition_diffs.append({"in": primary_a, "missing_from": compare_with, **d})
-                    for d in diffs_b_a[:2]:
-                        edition_diffs.append({"in": compare_with, "missing_from": primary_a, **d})
+                    sh = forensic_report.get("exact_8gram_shingles") or {}
+                    if (sh.get("excess_over_null") or 0) >= 5:
+                        diffs_a_b = self.corpus.classify_differences(primary_a, compare_with, min_run=40, max_runs=2)
+                        diffs_b_a = self.corpus.classify_differences(compare_with, primary_a, min_run=40, max_runs=2)
+                        for d in diffs_a_b[:2]:
+                            edition_diffs.append({"in": primary_a, "missing_from": compare_with, **d})
+                        for d in diffs_b_a[:2]:
+                            edition_diffs.append({"in": compare_with, "missing_from": primary_a, **d})
                 except Exception:
                     pass
         elif len(harvested_ids) >= 2:
             id_a, id_b = harvested_ids[0], harvested_ids[1]
             try:
-                forensic_report = self.forensic_compare(id_a, id_b, top_passages=2)
-                # Also check for structural additions/excisions between the two editions
-                diffs_a_b = self.corpus.classify_differences(id_a, id_b, min_run=40, max_runs=3)
-                diffs_b_a = self.corpus.classify_differences(id_b, id_a, min_run=40, max_runs=3)
-                for d in diffs_a_b[:2]:
-                    edition_diffs.append({"in": id_a, "missing_from": id_b, **d})
-                for d in diffs_b_a[:2]:
-                    edition_diffs.append({"in": id_b, "missing_from": id_a, **d})
+                cand = self.forensic_compare(id_a, id_b, top_passages=2)
+                sh = cand.get("exact_8gram_shingles") or {}
+                wins = cand.get("conceptual_window_alignments") or []
+                # Only include forensic report & edition diffs between auto-harvested items
+                # when they actually share substantive text (sibling editions or adaptations),
+                # never when they are two unrelated books that both mention the subject.
+                if (sh.get("excess_over_null") or 0) >= 5 or (wins and wins[0].get("jaccard", 0) >= 0.08):
+                    forensic_report = cand
+                if (sh.get("excess_over_null") or 0) >= 10:
+                    diffs_a_b = self.corpus.classify_differences(id_a, id_b, min_run=40, max_runs=3)
+                    diffs_b_a = self.corpus.classify_differences(id_b, id_a, min_run=40, max_runs=3)
+                    for d in diffs_a_b[:2]:
+                        edition_diffs.append({"in": id_a, "missing_from": id_b, **d})
+                    for d in diffs_b_a[:2]:
+                        edition_diffs.append({"in": id_b, "missing_from": id_a, **d})
             except Exception:
                 pass
 

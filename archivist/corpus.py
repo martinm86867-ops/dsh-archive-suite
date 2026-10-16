@@ -164,7 +164,7 @@ class CorpusDB:
             """
             INSERT INTO tokens
             SELECT ?, unnest(range(1, len(toks) + 1)) - 1, unnest(toks)
-            FROM (SELECT regexp_extract_all(lower(?), '[a-z0-9]+') AS toks)
+            FROM (SELECT regexp_extract_all(lower(?), '[a-z0-9\u00c0-\u024f]+') AS toks)
             """,
             [identifier, text],
         )
@@ -297,7 +297,7 @@ class CorpusDB:
             """
             INSERT INTO tokens
             SELECT ?, unnest(range(1, len(toks) + 1)) - 1, unnest(toks)
-            FROM (SELECT regexp_extract_all(lower(?), '[a-z0-9]+') AS toks)
+            FROM (SELECT regexp_extract_all(lower(?), '[a-z0-9\u00c0-\u024f]+') AS toks)
             """,
             [name, text],
         )
